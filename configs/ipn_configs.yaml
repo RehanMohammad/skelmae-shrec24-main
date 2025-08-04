@@ -1,0 +1,39 @@
+# exp config
+exp_name: 'IPN'
+seed: 0
+dataset: 'IPN'
+save_folder_path: './experiments/'
+
+# data config
+data:
+ data_dir: "D:\\Dataset\\IPN\\ipn\\landmarks"
+ train_ann: "D:\\Dataset\\IPN\\ipn\\annotations\\Annot_TrainList_splitted.txt"
+ val_ann:  "D:\\Dataset\\IPN\\ipn\\annotations\\Annot_ValidList_splitted.txt"
+ test_ann: "D:\\Dataset\\IPN\\ipn\\annotations\\Annot_TestList.txt"
+ normalize: True
+
+# mae model config
+mae:
+ num_joints: 21
+ coords_dim: 3
+ encoder_embed_dim: 256
+ encoder_depth: 6
+ num_heads: 8
+ mlp_dim: 512
+ decoder_dim: 64
+ decoder_depth: 6
+ masking_strategy: 'random-hand'
+ masking_ratio: 0.7
+ num_epochs: 100
+ lr: 2e-4
+ weight_decay: 0.05
+ batch_size: 64
+
+## stgcn model configs
+stgcn:
+ sequence_length: 3000
+ num_classes: 14
+ num_epochs: 30
+ lr: 1e-3
+ weight_decay: 0.0005
+ batch_size: 2
