@@ -11,6 +11,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 import torch.optim as optim
+from model.sgcn import SGCNModel
+
 
 # from dataset.shrec24_dataset import PretrainingDataset, FinetuningDataset
 from dataset.IPN import IPNDataset as PretrainingDataset, FinetuningDataset 
@@ -65,57 +67,69 @@ if __name__ == '__main__':
 	print(15*'=', 'FIRST PHASE: PRETRAINING....', 15*'=')
 	print('\nLoading Pretraining Datasets....')
 	data_args = args.data
-	#IPN
-	train_set = PretrainingDataset(data_dir=data_args.data_dir,ann_file=data_args.train_ann,
-								   normalize=data_args.normalize)
-
-	valid_set = PretrainingDataset(data_dir=data_args.data_dir, ann_file= data_args.val_ann,
-								   normalize=data_args.normalize)
-
-	# #SHREC 24
-	# train_set = PretrainingDataset(data_dir=data_args.train_data_dir,
-	# 							   normalize=data_args.normalize)
-
-	# valid_set = PretrainingDataset(data_dir=data_args.test_data_dir, 
-	# 							   normalize=data_args.normalize)
-
-	print('# Train: {}, # Valid: {}'.format(len(train_set), len(valid_set)))
+	train_set = PretrainingDataset(
+        data_dir  = data_args.data_dir,
+        ann_file  = data_args.train_ann,
+        normalize = data_args.normalize
+    )
+	valid_set = PretrainingDataset(
+        data_dir  = data_args.data_dir,
+        ann_file  = data_args.val_ann,
+        normalize = data_args.normalize
+    )
 	train_loader = DataLoader(train_set, batch_size=args.mae.batch_size, shuffle=True)
 	valid_loader = DataLoader(valid_set, batch_size=args.mae.batch_size, shuffle=False)
 
-	print('\nBuilding MAE model....')
+    #
+    # 2) BUILD MAE
+    #
 	mae_args = args.mae
-
 	encoder = ViT(
-				num_nodes=mae_args.num_joints,
-				node_dim=mae_args.coords_dim,
-				num_classes=mae_args.coords_dim,
-				dim=mae_args.encoder_embed_dim,
-				depth=mae_args.encoder_depth,
-				heads=mae_args.num_heads,
-				mlp_dim=mae_args.mlp_dim ,
-				pool = 'cls',
-				dropout = 0.,
-				emb_dropout = 0.
-			)
-
+        num_nodes    = mae_args.num_joints,
+        node_dim     = mae_args.coords_dim,
+        num_classes  = mae_args.coords_dim,
+        dim          = mae_args.encoder_embed_dim,
+        depth        = mae_args.encoder_depth,
+        heads        = mae_args.num_heads,
+        mlp_dim      = mae_args.mlp_dim,
+        pool         = 'cls',
+        dropout      = 0.0,
+        emb_dropout  = 0.0
+    )
 	mae = MAE(
-			encoder=encoder,
-			decoder_dim=mae_args.decoder_dim,
-			decoder_depth=mae_args.decoder_depth,
-			masking_strategy=mae_args.masking_strategy,
-			masking_ratio=mae_args.masking_ratio,
-			).to(device)
+        encoder           = encoder,
+        decoder_dim       = mae_args.decoder_dim,
+        decoder_depth     = mae_args.decoder_depth,
+        masking_strategy  = mae_args.masking_strategy,
+        masking_ratio     = mae_args.masking_ratio,
+    ).to(device)
+	chkpt_dir = opt.join(args.save_folder_path, args.exp_name, 'weights')
+	chkpt_path = opt.join(chkpt_dir, 'best_mae_model.pth')
+	os.makedirs(chkpt_dir, exist_ok=True)
 
-	optimizer = optim.AdamW(mae.parameters(), lr=mae_args.lr)
-	scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)
+    #
+    # 3) CONDITIONAL PRE-TRAINING
+    #
+	if os.path.isfile(chkpt_path):
+		print(f"\n→ Found existing MAE checkpoint at {chkpt_path}, loading and skipping pre-training.")
+		ck = torch.load(chkpt_path, map_location=device)
+		mae.load_state_dict(ck['state_dict'])
+	else:
+		print("\n============== FIRST PHASE: PRE-TRAINING ==============")
+		optimizer = optim.AdamW(mae.parameters(), lr=mae_args.lr)
+		scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=mae_args.num_epochs)
+		n_params = sum(p.numel() for p in mae.parameters() if p.requires_grad)
+		print("total number of parameters of the MAE:", n_params)
+		print("\n Training MAE…")
+		training_mae_loop(mae, train_loader, valid_loader,
+                          optimizer, scheduler, device, args)
+		print(f"\n→ MAE pre-trained and saved to {chkpt_path}")
+	mae.freeze()
 
-	n_params = sum(p.numel() for p in mae.parameters() if p.requires_grad)
-	print("total number of parameters of the MAE: ", n_params)
 
-	print('\n Training MAE...')
-	training_mae_loop(mae, train_loader, valid_loader, optimizer, scheduler, device, args)
-
+    #
+    # 4) FINETUNING
+    #
 
 
 	## SECOND PHASE: FINETUNING....
@@ -124,18 +138,22 @@ if __name__ == '__main__':
 
 	print('\nLoading Finetuning data....')
 	data_args = args.data
-	stgcn_args = args.stgcn
-	train_set = FinetuningDataset(data_dir=data_args.train_data_dir,
-								 T=stgcn_args.sequence_length,
-								 normalize=data_args.normalize)
+	sgcn_args = args.sgcn
+	train_set = FinetuningDataset(data_dir  = data_args.data_dir,
+        ann_file  = data_args.train_ann,
+        max_seq   = sgcn_args.sequence_length,
+        normalize = data_args.normalize)
 
-	valid_set = FinetuningDataset(data_dir=data_args.test_data_dir,
-								 T=stgcn_args.sequence_length,
-								 normalize=data_args.normalize)
+	valid_set = FinetuningDataset(
+        data_dir  = data_args.data_dir,
+        ann_file  = data_args.val_ann,
+        max_seq   = sgcn_args.sequence_length,
+        normalize = data_args.normalize
+)
 
 	print('# Train: {}, # Valid: {}'.format(len(train_set), len(valid_set)))
-	train_loader = DataLoader(train_set, batch_size=stgcn_args.batch_size, shuffle=True)
-	valid_loader = DataLoader(valid_set, batch_size=stgcn_args.batch_size, shuffle=False)
+	train_loader = DataLoader(train_set, batch_size=sgcn_args.batch_size, shuffle=True)
+	valid_loader = DataLoader(valid_set, batch_size=sgcn_args.batch_size, shuffle=False)
 
 	print('\nLoading MAE Pretrained Weights....', end='')	
 	## MODEL & OPTIMIZER
@@ -171,25 +189,28 @@ if __name__ == '__main__':
 	mae.freeze()
 
 	print('\n Building STGCN model....')
+	sgcn =SGCNModel(args)
 
-	stgcn = STGCN(channel=mae_args.decoder_dim,
-				  num_class=stgcn_args.num_classes,
-				  window_size=stgcn_args.sequence_length,
-				  num_point=mae_args.num_joints,
-				  num_person=1,
-				  use_data_bn=False,
-				  backbone_config=None,
-				  graph_args={'config':'shrec24'},
-				  mask_learning=False,
-				  use_local_bn=False,
-				  multiscale=False,
-				  temporal_kernel_size=11,
-				  dropout=0.5).to(device)
+	# stgcn = STGCN(channel=mae_args.decoder_dim,
+	# 			  num_class=stgcn_args.num_classes,
+	# 			  window_size=stgcn_args.sequence_length,
+	# 			  num_point=mae_args.num_joints,
+	# 			  num_person=1,
+	# 			  use_data_bn=False,
+	# 			  backbone_config=None,
+	# 			  graph_args={'config':'shrec24'},
+	# 			  mask_learning=False,
+	# 			  use_local_bn=False,
+	# 			  multiscale=False,
+	# 			  temporal_kernel_size=11,
+	# 			  dropout=0.5).to(device)
 
 
-	optimizer = optim.AdamW(stgcn.parameters(), lr=stgcn_args.lr, weight_decay=stgcn_args.weight_decay)
+	# optimizer = optim.AdamW(stgcn.parameters(), lr=stgcn_args.lr, weight_decay=stgcn_args.weight_decay)
+	optimizer = optim.AdamW(sgcn.parameters(), lr=sgcn_args.lr, weight_decay=sgcn_args.weight_decay)
 	scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=0, last_epoch=-1)
 	criterion = nn.CrossEntropyLoss()
 
 	print('\n Training STGCN....')
-	training_stgcn_loop(stgcn, mae, train_loader, valid_loader, optimizer, criterion, scheduler, device, args)
+	# training_stgcn_loop(stgcn, mae, train_loader, valid_loader, optimizer, criterion, scheduler, device, args)
+	training_stgcn_loop(sgcn, mae, train_loader, valid_loader, optimizer, criterion, scheduler, device, args)
