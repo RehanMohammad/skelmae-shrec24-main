@@ -141,13 +141,13 @@ if __name__ == '__main__':
 	sgcn_args = args.sgcn
 	train_set = FinetuningDataset(data_dir  = data_args.data_dir,
         ann_file  = data_args.train_ann,
-        max_seq   = sgcn_args.sequence_length,
+        max_seq   = sgcn_args.max_seq_len,
         normalize = data_args.normalize)
 
 	valid_set = FinetuningDataset(
         data_dir  = data_args.data_dir,
         ann_file  = data_args.val_ann,
-        max_seq   = sgcn_args.sequence_length,
+        max_seq   = sgcn_args.max_seq_len,
         normalize = data_args.normalize
 )
 
@@ -189,7 +189,7 @@ if __name__ == '__main__':
 	mae.freeze()
 
 	print('\n Building STGCN model....')
-	sgcn =SGCNModel(args)
+	sgcn =SGCNModel(sgcn_args).to(device)
 
 	# stgcn = STGCN(channel=mae_args.decoder_dim,
 	# 			  num_class=stgcn_args.num_classes,
