@@ -19,16 +19,20 @@ def train_one_epoch(epoch, num_epochs, model, mae, optimizer, dataloader, criter
 
     for d in pbar:
         sequence = d['Sequence'].to(device)
-        adj_mat = d['AM'].to(device)
+        # adj_mat = d['AM'].to(device)
+        adj_mat_spatial = d['A_spatial'].to(device)
+        adj_mat_temporal = d['A_temporal'].to(device)
+        identity = [adj_mat_spatial, adj_mat_temporal]
         label = d['Label'].to(device)
         
-        tokens = mae.inference(sequence, adj_mat)
+        # tokens = mae.inference(sequence, adj_mat)
 
-        tokens = rearrange(tokens, 'b t n d -> b d t n')
-        tokens = tokens.unsqueeze(-1)
+        # tokens = rearrange(tokens, 'b t n d -> b d t n')
+        # tokens = tokens.unsqueeze(-1)
         
         optimizer.zero_grad()
-        pred = model(tokens)
+        pred = model(sequence, identity)
+        pred, _, pred_spatial_adj, _ = model(V, identity)
         loss_train = criterion(pred, label)
         loss_train.backward()
         optimizer.step()
@@ -147,7 +151,7 @@ def eval_stgcn(stgcn, mae, dataloader, device, args):
 
 def training_stgcn_loop(model, mae, train_loader, valid_loader, optimizer, criterion, scheduler, device, args):
 
-    model_args = args.stgcn
+    model_args = args.sgcn
     save_folder_path = opt.join(args.save_folder_path, args.exp_name,'weights/')
     os.makedirs(save_folder_path, exist_ok=True)
 
