@@ -60,37 +60,56 @@ def train_one_epoch(epoch, num_epochs, model, mae, optimizer, dataloader, criter
         
 
 def valid_one_epoch(model, mae, dataloader, criterion, device):
+    model.eval()
+    mae.eval()  # not used here, but keeping symmetry is fine
+
     accuracy = 0.0
     n = 0
-    pred_labels, true_labels = [], []
     valid_loss = 0.0
-    model.eval()
-    mae.eval()
+    pred_labels, true_labels = [], []
+
     with torch.no_grad():
         pbar = tqdm(dataloader, total=len(dataloader))
         for d in pbar:
+            # inputs
             sequence = d['Sequence'].to(device)
-            adj_mat = d['AM'].to(device)
+            A_spatial = d['A_spatial'].to(device)
+            A_temporal = d['A_temporal'].to(device)
+            identity = [A_spatial, A_temporal]
+
             label = d['Label'].to(device)
 
-            tokens = mae.inference(sequence, adj_mat)
-            tokens = rearrange(tokens, 'b t n d -> b d t n')
-            tokens = tokens.unsqueeze(-1)
-        
-            true_labels.extend(label.tolist())
-            output = model(tokens)
-            loss_valid = criterion(output, label)
-            accuracy += (output.argmax(dim=1) == label.flatten()).sum().item()
-            n += len(label.flatten())
+            # forward (mirror training: no MAE tokens)
+            pred, _, _, _ = model(sequence, identity)
+
+            # make sure logits are [B, num_classes]
+            if pred.dim() == 3 and pred.size(0) == 1:
+                pred = pred.squeeze(0)     # [1,B,C] -> [B,C]
+            elif pred.dim() == 1:
+                pred = pred.unsqueeze(0)   # [C] -> [1,C]
+
+            # label to indices [B]
+            if label.dim() == 2 and label.size(1) == 1:
+                label = label.squeeze(1)
+            elif label.dim() == 2 and label.size(1) > 1:  # one-hot
+                label = label.argmax(dim=1)
+            label = label.long()
+
+            # loss / metrics
+            loss_valid = criterion(pred, label)
             valid_loss += loss_valid.item()
-            
-            pred_labels.extend(output.argmax(dim=1).tolist())
-            desc = '[VALID]> loss. %.2f > acc. %.2f%%' % (valid_loss, (accuracy / n)*100)
-            pbar.set_description(desc)
 
+            preds = pred.argmax(dim=1)
+            accuracy += (preds == label).sum().item()
+            n += label.numel()
 
-    accuracy = (accuracy / n)*100
-                
+            # logs
+            pred_labels.extend(preds.tolist())
+            true_labels.extend(label.tolist())
+            pbar.set_description('[VALID]> loss: %.4f | acc: %.2f%%' %
+                                 (valid_loss, (accuracy / max(n, 1)) * 100.0))
+
+    accuracy = (accuracy / max(n, 1)) * 100.0
     return valid_loss, accuracy, true_labels, pred_labels
 
 
