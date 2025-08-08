@@ -33,6 +33,18 @@ def train_one_epoch(epoch, num_epochs, model, mae, optimizer, dataloader, criter
         optimizer.zero_grad()
         pred = model(sequence, identity)
         pred, _, pred_spatial_adj, _ = model(sequence, identity)
+        label = label.to(device)
+
+        # If labels come as [B, 1] -> squeeze to [B]
+        if label.dim() == 2 and label.size(1) == 1:
+            label = label.squeeze(1)
+
+        # If labels are one-hot [B, num_classes] -> convert to indices [B]
+        if label.dim() == 2 and label.size(1) == args.num_classes:
+            label = label.argmax(dim=1)
+
+        # Ensure dtype long
+        label = label.long()
         loss_train = criterion(pred, label)
         loss_train.backward()
         optimizer.step()

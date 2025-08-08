@@ -150,31 +150,26 @@ class SelfAttention(nn.Module):
 
     
 class SpatialTemporalFusion(nn.Module):
-
     def __init__(self, n_frames):
         super(SpatialTemporalFusion, self).__init__()
-
         self.conv = nn.Sequential(
             nn.Conv2d(n_frames, n_frames, 1),
             nn.BatchNorm2d(n_frames),
             nn.PReLU(),
             nn.Conv2d(n_frames, n_frames, 1),
-            nn.BatchNorm2d(n_frames)
+            nn.BatchNorm2d(n_frames),
         )
-
         self.shortcut = nn.Sequential(
             nn.Conv2d(n_frames, n_frames, 1),
-            nn.BatchNorm2d(n_frames)
+            nn.BatchNorm2d(n_frames),
         )
 
     def forward(self, x):
-
         out = self.conv(x)
-        out += self.shortcut(x)
+        out = out + self.shortcut(x)
+        out = F.relu(out, inplace=True)
+        return out     # <-- DO NOT .squeeze()
 
-        out = F.relu(out)
-
-        return out.squeeze()
 
 
 class SparseWeightedAdjacency(nn.Module):
@@ -408,10 +403,11 @@ class SGCNModel(nn.Module):
         self.spatial_edge_weights  = nn.Sequential(nn.Linear(args.num_features, args.num_heads, bias=True),
                                                    nn.Linear(args.num_heads, args.num_heads*args.num_nodes, bias=True))
         
-        emb_dim = args.embedding_dims // args.num_heads  # this is the Emb you use in GCN blocks
+        # emb_dim = args.embedding_dims // args.num_heads  # this is the Emb you use in GCN blocks
+        D = args.embedding_dims // args.num_heads
         self.mlp = nn.Sequential(
-            nn.Flatten(start_dim=1),                                # [B, T*Emb]
-            nn.Linear(args.max_seq_len * emb_dim, 512),
+            nn.Flatten(start_dim=1),
+            nn.Linear(args.max_seq_len * D, 512),    # 80 * 16 = 1280  ✅
             nn.PReLU(),
             nn.Dropout(args.dropout),
             nn.Linear(512, 128),
@@ -496,4 +492,4 @@ class SGCNModel(nn.Module):
         gcn_representation = torch.mean(gcn_representation, dim=-2)
         prediction = self.mlp(gcn_representation)
 
-        return prediction.unsqueeze(dim=0), gcn_representation, normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix
+        return prediction, gcn_representation, normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix
