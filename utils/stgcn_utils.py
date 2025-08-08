@@ -32,7 +32,7 @@ def train_one_epoch(epoch, num_epochs, model, mae, optimizer, dataloader, criter
         
         optimizer.zero_grad()
         pred = model(sequence, identity)
-        pred, _, pred_spatial_adj, _ = model(V, identity)
+        pred, _, pred_spatial_adj, _ = model(sequence, identity)
         loss_train = criterion(pred, label)
         loss_train.backward()
         optimizer.step()

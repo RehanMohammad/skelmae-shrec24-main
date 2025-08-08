@@ -184,8 +184,9 @@ class SparseWeightedAdjacency(nn.Module):
 
         # positional encoder
         #self.positional_encoder = PositionalEncoder(embedding_dims)
-        self.pes = PositionalEncoding (channel = spa_in_dims, joint_num = n_nodes, time_len = n_frames, domain = "spatial")
-        self.pet = PositionalEncoding (channel = tem_in_dims, joint_num = n_nodes, time_len = n_frames, domain = "temporal")
+        self.pes = PositionalEncoding(channel=3, joint_num=n_nodes, time_len=n_frames, domain="spatial")
+        self.pet = PositionalEncoding(channel=3, joint_num=n_nodes, time_len=n_frames, domain="temporal")
+
 
         ##Regulation
         #self.attention0s = nn.Parameter(torch.ones(1, n_heads, 22, 22) + torch.eye(22),
@@ -207,42 +208,54 @@ class SparseWeightedAdjacency(nn.Module):
         self.n_nodes = n_nodes
 
     def forward(self, graph, identity):
-        graph =  graph.permute(0, 2, 3, 1)
-        # print("graph.shape", len(graph.shape))
-        # assert len(graph.shape) == 3
+       spatial_graph  = graph                              # [B,T,V,C]
+       temporal_graph = graph                              # [B,T,V,C]
 
-        spatial_graph = graph[:, :, :]
-        # print("spatial_graph.shape", spatial_graph.shape)
-        # print("spatial_graph", spatial_graph)
+       # add positional encodings (C must be 3)
+       spatial_graph  = self.pes(spatial_graph)            # [B,T,V,C]
+       temporal_graph = self.pet(temporal_graph)           # [B,T,V,C]
 
-        temporal_graph_emb = spatial_graph.permute(0,2, 1, 3)
-        # print("temporal_graph_emb.shape", temporal_graph_emb.shape)
-        # print("temporal_graph_emb", temporal_graph_emb)
+       # if your temporal attention needs [B,V,T,C], permute AFTER PE
+       temporal_graph_emb = temporal_graph.permute(0, 2, 1, 3)  # [B,V,T,C]
 
-        spatial_graph_emb = self.pet(spatial_graph)
+       # now continue
+       dense_spatial_interaction, spatial_embeddings = self.spatial_attention(spatial_graph,  multi_head=True)
+       dense_temporal_interaction, temporal_embeddings = self.temporal_attention(temporal_graph_emb, multi_head=True)
 
-        dense_spatial_interaction, spatial_embeddings = self.spatial_attention(spatial_graph_emb, multi_head=True) # Multi head Attention
+    #    dense_spatial_interaction, spatial_embeddings = self.spatial_attention(spatial_graph_emb, multi_head=True) # Multi head Attention
         
-        dense_temporal_interaction, temporal_embeddings = self.temporal_attention(temporal_graph_emb, multi_head=True) # Multi head Attention
+    #    dense_temporal_interaction, temporal_embeddings = self.temporal_attention(temporal_graph_emb, multi_head=True) # Multi head Attention
         
-        #dense_spatial_interaction = dense_spatial_interaction + self.attention0s.repeat(self.n_nodes, 1, 1, 1)
-        # print("dense_temporal_interaction.shape", dense_temporal_interaction.shape)
-        # print("dense_spatial_interaction.shape", dense_spatial_interaction.shape)
+       #dense_spatial_interaction = dense_spatial_interaction + self.attention0s.repeat(self.n_nodes, 1, 1, 1)
+       # print("dense_temporal_interaction.shape", dense_temporal_interaction.shape)
+       # print("dense_spatial_interaction.shape", dense_spatial_interaction.shape)
+       # attention fusion
+       # st_interaction = self.spa_fusion(dense_spatial_interaction.permute(1, 0, 2, 3)).permute(1, 0, 2, 3)
+       st_interaction = self.spa_fusion(dense_spatial_interaction)
+       ts_interaction = dense_temporal_interaction
+       spatial_mask, temporal_mask = self.interaction_mask(st_interaction, ts_interaction)
 
-        # attention fusion
-        # st_interaction = self.spa_fusion(dense_spatial_interaction.permute(1, 0, 2, 3)).permute(1, 0, 2, 3)
-        st_interaction = self.spa_fusion(dense_spatial_interaction)
-        ts_interaction = dense_temporal_interaction
-        spatial_mask, temporal_mask = self.interaction_mask(st_interaction, ts_interaction)
+       # self-connected
+       # spatial_mask = spatial_mask + identity[0].unsqueeze(1)
+       # temporal_mask = temporal_mask + identity[1].unsqueeze(1)
 
-        # self-connected
-        spatial_mask = spatial_mask + identity[0].unsqueeze(1)
-        temporal_mask = temporal_mask + identity[1].unsqueeze(1)
+       B, H, N, _ = spatial_mask.shape
+       V = self.n_nodes
+       T = N // V
 
-        normalized_spatial_adjacency_matrix = self.zero_softmax(dense_spatial_interaction * spatial_mask, dim=-1)
-        normalized_temporal_adjacency_matrix = self.zero_softmax(dense_temporal_interaction * temporal_mask, dim=-1)
+       # build the block-diag identity of size (T*V)x(T*V)
+       I_V = torch.eye(V, device=spatial_mask.device, dtype=spatial_mask.dtype)
+       I_T = torch.eye(T, device=spatial_mask.device, dtype=spatial_mask.dtype)
+       I_big = torch.kron(I_T, I_V).view(1,1,N,N)
 
-        return normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix,\
+       # add it instead of the tiny V×V identity
+       spatial_mask  = spatial_mask  + I_big
+       temporal_mask = temporal_mask + I_big
+
+       normalized_spatial_adjacency_matrix = self.zero_softmax(dense_spatial_interaction * spatial_mask, dim=-1)
+       normalized_temporal_adjacency_matrix = self.zero_softmax(dense_temporal_interaction * temporal_mask, dim=-1)
+
+       return normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix,\
                spatial_embeddings, temporal_embeddings
     
 
@@ -261,8 +274,14 @@ class GraphConvolution(nn.Module):
 
     def forward(self, graph, adjacency):
 
-        gcn_features = self.embedding(torch.matmul(adjacency, graph))
-        gcn_features = F.dropout(self.activation(gcn_features), p=self.dropout)
+        assert adjacency.dim() == 2, f"A must be [V,V], got {adjacency.shape}"
+        V = adjacency.shape[0]
+        assert graph.shape[-2] == V, f"graph last-2 dim must be V={V}, got {graph.shape}"
+
+        # Multiply along joints axis: [..., V, C] <- [V,V] x [..., V, C]
+        y = torch.einsum('vw,...wc->...vc', adjacency, graph)
+        gcn_features = self.embedding(y)
+        gcn_features = F.dropout(self.activation(gcn_features), p=self.dropout, training=self.training)
         return gcn_features
 
 class SparseGraphConvolution(nn.Module):
@@ -283,70 +302,71 @@ class SparseGraphConvolution(nn.Module):
                 self.spatial_temporal_sparse_gcn.append(GraphConvolution(embedding_dims, embedding_dims, dropout=dropout))
                 self.temporal_spatial_sparse_gcn.append(GraphConvolution(embedding_dims, embedding_dims, dropout=dropout)) 
 
-    def forward(self, graph, normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix):
+    
+    def forward(self, graph, A_spatial, A_temporal):
+        # graph: [B, T, V, C]
+        # force both branches to [T, B, V, C]
+        spa_graph = graph.permute(1, 0, 2, 3).contiguous()  # [T,B,V,C]
+        tem_graph = spa_graph                               # also [T,B,V,C]
 
-        spa_graph = graph.permute(1, 0, 2, 3)  
-        tem_graph = spa_graph.permute(2, 1, 0, 3)  
+        # sanity
+        Vs = spa_graph.shape[2]
+        assert A_spatial.dim() == 2 and A_spatial.shape == (Vs, Vs)
+        assert A_temporal.dim() == 2 and A_temporal.shape == (Vs, Vs)
 
-        gcn_spatial_features = self.spatial_temporal_sparse_gcn[0](spa_graph, normalized_spatial_adjacency_matrix)
-        gcn_spatial_features = gcn_spatial_features.permute(2, 1, 0, 3)
+        gcn_spatial_features  = self.spatial_temporal_sparse_gcn[0](spa_graph, A_spatial)   # -> [T,B,V,Emb]
+        gcn_spatial_features  = gcn_spatial_features.permute(2, 1, 0, 3)                    # [V,B,T,Emb]
 
         for i in range(1, len(self.spatial_temporal_sparse_gcn)):
-            gcn_spatial_features = self.spatial_temporal_sparse_gcn[i](gcn_spatial_features, normalized_temporal_adjacency_matrix)
-            #gcn_spatial_features = F.dropout(gcn_spatial_features, self.dropout, training=self.training)
+            gcn_spatial_features = self.spatial_temporal_sparse_gcn[i](gcn_spatial_features.permute(2,1,0,3), A_temporal)
+            gcn_spatial_features = gcn_spatial_features.permute(2,1,0,3)
 
-        gcn_temporal_features = self.temporal_spatial_sparse_gcn[0](tem_graph,
-                                                                   normalized_temporal_adjacency_matrix)
-        gcn_temporal_features = gcn_temporal_features.permute(2, 1, 0, 3)
+        gcn_temporal_features = self.temporal_spatial_sparse_gcn[0](tem_graph, A_temporal)  # -> [T,B,V,Emb]
+        gcn_temporal_features = gcn_temporal_features.permute(2, 1, 0, 3)                   # [V,B,T,Emb]
 
         for i in range(1, len(self.temporal_spatial_sparse_gcn)):
-            gcn_temporal_features = self.temporal_spatial_sparse_gcn[i](gcn_temporal_features,
-                                                                            normalized_spatial_adjacency_matrix)
-            #gcn_temporal_features = F.dropout(gcn_temporal_features, self.dropout, training=self.training)
+            gcn_temporal_features = self.temporal_spatial_sparse_gcn[i](gcn_temporal_features.permute(2,1,0,3), A_spatial)
+            gcn_temporal_features = gcn_temporal_features.permute(2,1,0,3)
 
-        gcn_temporal_spatial_features = gcn_temporal_features.permute(2, 1, 0, 3)
-
-        return gcn_spatial_features, gcn_temporal_spatial_features
+        # back to [B, H(=V), T, Emb] that your fusion expects
+        gcn_temporal_spatial_features = gcn_temporal_features.permute(1, 0, 2, 3)  # [B,V,T,Emb]
+        gcn_spatial_features          = gcn_spatial_features.permute(1, 0, 2, 3)  # [B,V,T,Emb]
+        return gcn_spatial_features, gcn_temporal_spatial_features      
 
 class PositionalEncoding(nn.Module):
-
     def __init__(self, channel, joint_num, time_len, domain):
-        super(PositionalEncoding, self).__init__()
+        super().__init__()
         self.joint_num = joint_num
-        self.time_len = time_len
-
-        self.domain = domain
+        self.time_len  = time_len
+        self.domain    = domain
 
         if domain == "temporal":
-            # temporal embedding
-            pos_list = []
-            for t in range(self.time_len):
-                for j_id in range(self.joint_num):
-                    pos_list.append(t)
-        elif domain == "spatial":
-            # spatial embedding
-            pos_list = []
-            for t in range(self.time_len):
-                for j_id in range(self.joint_num):
-                    pos_list.append(j_id)
+            pos = torch.arange(time_len).unsqueeze(1).repeat(1, joint_num)   # [T, V]
+        else:  # "spatial"
+            pos = torch.arange(joint_num).unsqueeze(0).repeat(time_len, 1)   # [T, V]
 
-        position = torch.from_numpy(np.array(pos_list)).unsqueeze(1).float()
-        # pe = position/position.max()*2 -1
-        # pe = pe.view(time_len, joint_num).unsqueeze(0).unsqueeze(0)
-        # Compute the positional encodings once in log space.
-        pe = torch.zeros(self.time_len * self.joint_num, channel)
+        idx      = torch.arange(channel)
+        even_idx = idx[0::2]
+        odd_idx  = idx[1::2]
 
-        div_term = torch.exp(torch.arange(0, channel, 2).float() *
-                             -(math.log(10000.0) / channel))  # channel//2
-        pe[:, 0::2] = torch.sin(position * div_term[1])
-        pe[:, 1::2] = torch.cos(position * div_term[1])
-        pe = pe.view(time_len, joint_num, channel).squeeze(0)
-        self.register_buffer('pe', pe)
+        div_term = torch.exp(even_idx.float() * (-(math.log(10000.0) / channel)))
 
-    def forward(self, x):  # nctv
-        # print(" x.shape",x.shape)
-        x = x + self.pe[ :, :, :x.size(2)]
-        return x
+        pe = torch.zeros(time_len, joint_num, channel)
+        pe[..., even_idx] = torch.sin(pos.unsqueeze(-1) * div_term)
+        if odd_idx.numel() > 0:
+            pe[..., odd_idx]  = torch.cos(pos.unsqueeze(-1) * div_term[:odd_idx.numel()])
+
+        self.register_buffer("pe", pe)  # [T, V, C]
+
+    def forward(self, x):  # x: [B, T, V, C]
+        if x.dim() != 4:
+            raise ValueError(f"PosEnc expects [B,T,V,C], got {x.shape}")
+        B, T, V, C = x.shape
+        if C > self.pe.size(-1):
+            raise ValueError(f"PE has channels {self.pe.size(-1)}, x has {C}")
+        pe = self.pe[:T, :V, :C].to(x.device)
+        return x + pe.unsqueeze(0)
+
 
 class SGCNModel(nn.Module):
 
@@ -375,7 +395,11 @@ class SGCNModel(nn.Module):
                                                  embedding_dims=args.embedding_dims // args.num_heads,
                                                  dropout=args.dropout))
         
-        self.fusion_ = nn.Conv2d(args.num_heads, args.num_heads, kernel_size=1, bias=False)
+        # self.fusion_ = nn.Conv2d(args.num_heads, args.num_heads, kernel_size=1, bias=False)
+        self.fusion_ = nn.Conv2d(args.num_nodes, args.num_nodes, kernel_size=1, bias=False)
+        # channels == V (21), matches the input you actually have: [B, V, T, Emb]
+
+
 
         ## spatial & temoral edges weights
         self.temporal_edge_weights = nn.Sequential(nn.Linear(args.num_features, args.num_heads, bias=True),
@@ -383,13 +407,11 @@ class SGCNModel(nn.Module):
         
         self.spatial_edge_weights  = nn.Sequential(nn.Linear(args.num_features, args.num_heads, bias=True),
                                                    nn.Linear(args.num_heads, args.num_heads*args.num_nodes, bias=True))
-        ## adaptive pooling
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, args.num_heads))
         
-        ## MLP
+        emb_dim = args.embedding_dims // args.num_heads  # this is the Emb you use in GCN blocks
         self.mlp = nn.Sequential(
-            nn.Flatten(start_dim=0),
-            nn.Linear((args.embedding_dims * args.num_nodes  * args.max_seq_len ) // args.num_heads, 512),
+            nn.Flatten(start_dim=1),                                # [B, T*Emb]
+            nn.Linear(args.max_seq_len * emb_dim, 512),
             nn.PReLU(),
             nn.Dropout(args.dropout),
             nn.Linear(512, 128),
@@ -397,13 +419,47 @@ class SGCNModel(nn.Module):
             nn.Dropout(args.dropout),
             nn.Linear(128, args.num_classes)
         )
+        
+        ## adaptive pooling
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, args.num_heads))
+        
+        ## MLP
+        # self.mlp = nn.Sequential(
+        #     nn.Flatten(start_dim=0),
+        #     nn.Linear((args.embedding_dims * args.num_nodes  * args.max_seq_len ) // args.num_heads, 512),
+        #     nn.PReLU(),
+        #     nn.Dropout(args.dropout),
+        #     nn.Linear(512, 128),
+        #     nn.PReLU(),
+        #     nn.Dropout(args.dropout),
+        #     nn.Linear(128, args.num_classes)
+        # )
 
 
     def forward(self, graph, identity):
 
+        if graph.dim() != 4:
+            raise ValueError(f"Expected 4D tensor, got {graph.shape}")
+
+        if graph.shape[-1] == 3:
+            # already [B, T, V, C]
+            pass
+        elif graph.shape[1] == 3:
+            # convert [B, C, T, V] -> [B, T, V, C]
+            graph = graph.permute(0, 2, 3, 1).contiguous()
+        else:
+            raise ValueError(f"Can't infer layout; got {graph.shape}. "
+                            "Expected [B,T,V,C] or [B,C,T,V] with C=3")
+
+        # sanity check
+        B, T, V, C = graph.shape
+        assert C == 3, f"Expected C=3, got {C}"
+
+        # graph = graph.permute(0, 3, 1, 2).contiguous()
+
         # graph 1 obs_len N 3
         normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix, spatial_embeddings, temporal_embeddings = \
-            self.sparse_weighted_adjacency_matrices(graph.squeeze(), identity)
+            self.sparse_weighted_adjacency_matrices(graph, identity)
         
         #W_spatio = self.spatial_edge_weights(graph)
         #W_spatio = W_spatio.reshape(normalized_spatial_adjacency_matrix.shape)
@@ -414,9 +470,25 @@ class SGCNModel(nn.Module):
         #weighted_normalized_spatial_adjacency_matrix  = normalized_spatial_adjacency_matrix * W_spatio
         #weighted_normalized_temporal_adjacency_matrix = normalized_temporal_adjacency_matrix * W_tempo
         
+        # for layer in self.stsgcn:
+        #      gcn_temporal_spatial_features, gcn_spatial_temporal_features = layer(
+        #         graph, normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix
+        #     )
+
+        # collapse batch and time into a small [H, V, V] adjacency
+        B, H, N, _ = normalized_spatial_adjacency_matrix.shape
+        V = 21   # e.g. 21
+
+        # Option A: just take the first frame’s adjacency
+        A_spatial_small  = normalized_spatial_adjacency_matrix.mean(dim=1)[0, :V, :V]   # [V,V]
+        A_temporal_small = normalized_temporal_adjacency_matrix.mean(dim=1)[0, :V, :V]  # [V,V]
+        
+        # now pass those into your GCNs
         for layer in self.stsgcn:
             gcn_temporal_spatial_features, gcn_spatial_temporal_features = layer(
-                graph, normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix
+                graph,             # still [B, C, T, V]
+                A_spatial_small,   # now [H, V, V]
+                A_temporal_small   # now [H, V, V]
             )
 
         gcn_representation = self.fusion_(gcn_temporal_spatial_features) + gcn_spatial_temporal_features
