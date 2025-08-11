@@ -21,7 +21,7 @@ import sys
 sys.path.append('./model')
 from model.vit import ViT
 from model.mae import MAE
-from utils.visualize import plot_temporal_heatmap, plot_joint_importance
+from utils.visualize import plot_temporal_heatmap 
 from model.temporal_attention import AdaptiveTemporal
 import warnings
 warnings.filterwarnings(
@@ -145,7 +145,9 @@ def visualize_attention(model, sample, epoch):
         dynamic_A = output['dynamic_A'].cpu()
         
         # Visualize for first head
-        plot_temporal_heatmap(dynamic_A[0], frame_idx=0, head_idx=0)
+        plot_temporal_heatmap(dynamic_A, frame_idx=0, head_idx=0,
+                      title=f"Temporal A (epoch {epoch})",
+                      savepath=f"attention_epoch{epoch}.png")
         plt.savefig(f'attention_epoch{epoch}.png')
         plt.close()
 
