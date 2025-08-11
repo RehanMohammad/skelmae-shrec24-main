@@ -24,10 +24,11 @@ mae:
  decoder_depth: 6
  masking_strategy: 'random-hand'
  masking_ratio: 0.7
- num_epochs: 1
+ num_epochs: 100
  lr: 2e-4
  weight_decay: 0.05
  batch_size: 64
+ sequence_length: 4
 
 ## stgcn model configs
 # stgcn:
@@ -51,7 +52,7 @@ sgcn:
   lr: 1e-3
   weight_decay: 5e-2
   max_seq_len: 80
-  batch_size: 32
+  batch_size: 1
   device: 'cuda'
   num_classes: 14
 

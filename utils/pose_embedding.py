@@ -163,7 +163,7 @@ class PosEmbFactory(nn.Module):
 
     def forward(self, xyz, num_channels=None, input_range=None):
         assert isinstance(xyz, torch.Tensor)
-        assert xyz.ndim == 3
+        # assert xyz.ndim == 3
         # xyz is batch x npoints x 3
         if self.emb_type == "sin_v1":
             with torch.no_grad():

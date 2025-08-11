@@ -3,7 +3,7 @@ from torch import nn
 
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
-from timm.models.layers import trunc_normal_
+from timm.layers import trunc_normal_, DropPath, PatchEmbed, Mlp
 
 import sys
 sys.path.append('./utils/')
@@ -70,14 +70,21 @@ class Attention(nn.Module):
         attn = self.attend(dots)
         if a is not None:
             attn = attn * a.unsqueeze(1)
-        attn = attn.sum(dim=2)
         attn = self.dropout(attn)
-
-        attn = attn.unsqueeze(-2)
-        
-        out = torch.matmul(attn, v)
+        out = torch.matmul(attn, v)                 # [b,h,n,d]
         out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
+
+
+        
+        # attn = attn.sum(dim=2)
+        # attn = self.dropout(attn)
+
+        # attn = attn.unsqueeze(-2)
+        
+        # out = torch.matmul(attn, v)
+        # out = rearrange(out, 'b h n d -> b n (h d)')
+        # return self.to_out(out)
 
 class Transformer(nn.Module):
     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout=0.):

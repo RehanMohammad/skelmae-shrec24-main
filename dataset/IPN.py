@@ -18,6 +18,22 @@ from torch.utils.data import DataLoader
 # ]
 
 
+LABELS= ["no_gesture",
+                            "point_1f",
+                            "point_2f",
+                            "click_1f",
+                            "click_2f",
+                            "throw_up",
+                            "throw_down",
+                            "throw_left",
+                            "throw_right",
+                            "open_twice",
+                            "double_click_1f",
+                            "double_click_2f",
+                            "zoom_in",
+                            "zoom_out",
+                            ]
+
 HAND_CONNECTIONS = [
     (0,1),(1,2),(2,3),(3,4), #thumb
     (0,5),(5,6),(6,7),(7,8), #index
@@ -51,6 +67,45 @@ _TEMPORAL_RULES = {
     20: [ 0, 19, 20],
 }
 
+
+def top_k(array, k):
+        flat = array.flatten()
+        indices = np.argpartition(flat, -k)[-k:]
+        indices = indices[np.argsort(-flat[indices])]
+        return np.sort(np.unravel_index(indices, array.shape))
+    
+def interpolate_landmarks(landmarks, L):
+        l, n_landmarks, _ = landmarks.shape
+        assert l > 1, "The sequence of landmarks should have at least two landmarks"
+
+        # Compute the indices of the input landmarks
+        input_indices = np.linspace(0, l - 1, l, dtype=int)
+
+        # Compute the indices of the output landmarks
+        output_indices = np.linspace(0, l - 1, L, dtype=float)
+
+        # Compute the fractional part of the output indices
+        fractions = output_indices % 1
+
+        # Compute the integer part of the output indices
+        output_indices = np.floor(output_indices).astype(int)
+
+        # Initialize the output array
+        interpolated_landmarks = np.zeros((L, n_landmarks,4), dtype=float)
+
+        # Compute the interpolated landmarks
+        for i in range(L):
+            if fractions[i] == 0:
+                # The output index corresponds to an input landmark, so just copy it
+                interpolated_landmarks[i] = landmarks[input_indices[output_indices[i]]]
+            else:
+                # Compute the mean vector between the two nearest input landmarks
+                v1 = landmarks[input_indices[output_indices[i]]]
+                v2 = landmarks[input_indices[min(output_indices[i] + 1, l - 1)]]
+                interpolated_landmarks[i] = np.mean([v1, v2], axis=0)
+
+        return interpolated_landmarks
+
 # Sanity‑check: every joint is present
 assert set(_TEMPORAL_RULES.keys()) == set(range(21)), "Rules must cover 0‑20 joints"
 
@@ -58,39 +113,69 @@ assert set(_TEMPORAL_RULES.keys()) == set(range(21)), "Rules must cover 0‑20 j
 # ------------------------------------------------------------------
 # 2. Graph builder
 # ------------------------------------------------------------------
-def build_temporal_edges(T: int, device="cpu") -> torch.Tensor:
+def build_temporal_edges(
+    T: int,
+    device="cpu",
+    model=None,
+    x: torch.Tensor=None,
+    threshold: float = 0.5,
+) -> torch.Tensor:
     """
-    Create a (T, V, V) boolean tensor where entry [t, i, j] == 1
-    means there is an edge *from* joint i at frame t
-    *to*   joint j at frame t+1.
+    Build temporal adjacency A[t] for links from frame t -> t+1.
+    If `model` is None or `x` is None -> fixed rules.
+    Else -> use per-frame attention from (current, next) frames.
 
-    The last frame has no outgoing links (all zeros).
-
-    Parameters
-    ----------
-    T : int
-        Number of frames in the sequence.
-    device : str or torch.device
-        Where to place the tensor.
-
-    Returns
-    -------
-    A_tmp : torch.BoolTensor
-        Shape = (T, 21, 21)
+    Returns:
+        Bool tensor [T, 21, 21]; last frame is all zeros.
     """
     V = 21
-    A_tmp = torch.zeros((T, V, V), dtype=torch.bool, device=device)
+    A = torch.zeros((T, V, V), dtype=torch.bool, device=device)
 
-    # For frames 0 … T‑2 : add the user‑defined edges to next frame
-    for t in range(T - 1):
-        for src, dest_list in _TEMPORAL_RULES.items():
-            for dst in dest_list:
-                A_tmp[t, src, dst] = True
+    # Fixed rules fallback
+    if model is None or x is None:
+        for t in range(T - 1):
+            for src, dest_list in _TEMPORAL_RULES.items():
+                for dst in dest_list:
+                    A[t, src, dst] = True
+        return A
 
-    # (Optional) self‑loop from each joint t→t+1  — already included for src==dst (rule 0)
-    # If you *don’t* want identity edges, remove the first element (=src) from each dest_list above.
+    # Ensure [B, C, T, V]
+    if x.dim() == 3:  # [C,T,V] from dataset
+        x = x.unsqueeze(0)
+    assert x.dim() == 4, f"x must be [B,C,T,V], got {x.shape}"
+    B, C, T_in, V_in = x.shape
+    assert T_in == T, f"T mismatch: x has T={T_in}, expected {T}"
+    assert V_in == V, f"V mismatch: x has V={V_in}, expected {V}"
 
-    return A_tmp
+    # use only xyz channels for attention
+    xyz = x[:, :3, :, :]  # [B,3,T,V]
+
+    # Infer per-frame attention
+    model_was_training = getattr(model, "training", False)
+    if hasattr(model, "eval"): model.eval()
+    attn_ts = []
+    with torch.no_grad():
+        for t in range(T - 1):
+            cur = xyz[:, :, t,  :].permute(0, 2, 1)  # [B,V,3]
+            nxt = xyz[:, :, t+1,:].permute(0, 2, 1)  # [B,V,3]
+            attn_t = model(cur, nxt)                 # expected [B, V, heads, V] or [B,V,V]
+
+            # normalize shapes -> [B, V, V]
+            if attn_t.dim() == 4 and attn_t.shape[2] >= 1:
+                attn_t = attn_t.mean(dim=2)         # avg heads
+            elif attn_t.dim() == 3:
+                pass
+            else:
+                raise ValueError(f"Unexpected attention shape {attn_t.shape}")
+            attn_ts.append(attn_t)                   # list of [B,V,V]
+
+    if model_was_training and hasattr(model, "train"): model.train()
+
+    # stack to [B, T-1, V, V] then average over batch and binarize
+    scores = torch.stack(attn_ts, dim=1).mean(dim=0)   # [T-1, V, V]
+    A[:-1] = scores > threshold
+    return A
+
 
 def get_adjacency_matrix(connections):
     n_lands = len(set([joint for tup in connections for joint in tup]))
@@ -101,51 +186,45 @@ def get_adjacency_matrix(connections):
     adj += np.eye(adj.shape[0])
     return adj
 
+def calculate_connectivity(adj_matrix, edges):
+    connectivity = {i: 0 for i in range(len(adj_matrix))}
+    for edge in edges:
+        connectivity[edge[0]] += 1
+    return connectivity
+
 
 IPN_AM = get_adjacency_matrix(HAND_CONNECTIONS)
 IPN_AM = torch.from_numpy(IPN_AM).float()
-
+CONNECTIVITY = calculate_connectivity(IPN_AM, HAND_CONNECTIONS) 
 
 class IPNDataset(Dataset):
     """
     Reads IPN annotations (.csv) and landmark .txt files.
     Returns: {'Sequence': Tensor(C=5, T=max_seq, V=21), 'Label': LongTensor}
     """
-    def __init__(self, data_dir, ann_file, max_seq=4, normalize=True):
+    def __init__(self, data_dir, ann_file, max_seq=4, normalize=True,
+                 temporal_edge_model=None, edge_threshold=0.5):
         self.data_dir  = data_dir
         self.ann_file  = ann_file
         self.max_seq   = max_seq
         self.normalize = normalize
-
-        assert opt.exists(data_dir), 'path {} does not exist'.format(data_dir)
-        ## data
-        self.data_dir = data_dir
-        
-        self.label_map = ["no_gesture",
-                            "point_1f",
-                            "point_2f",
-                            "click_1f",
-                            "click_2f",
-                            "throw_up",
-                            "throw_down",
-                            "throw_left",
-                            "throw_right",
-                            "open_twice",
-                            "double_click_1f",
-                            "double_click_2f",
-                            "zoom_in",
-                            "zoom_out",
-                            ]
-
-        # precompute connectivity count per joint
+        self.label_map = LABELS
         self.connectivity = {i:0 for i in range(21)}
+        self.temporal_edge_model = temporal_edge_model
+        self.edge_threshold = edge_threshold
+        self.samples = []
+
+        assert opt.exists(data_dir), 'path {} does not exist'.format(data_dir)   
+             
+        # precompute connectivity count per joint
+        
         for p,c in HAND_CONNECTIONS:
             self.connectivity[p] += 1
             self.connectivity[c] += 1
 
 
         # load all (feature, label) samples
-        self.samples = []
+        
         with open(self.ann_file, 'r') as f:
             for line in f:
                 parts = line.strip().split(',')
@@ -170,12 +249,12 @@ class IPNDataset(Dataset):
 
         # split into raw frame blocks
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            raw_blocks = [blk for blk in f.read().split('\n\n') ]#if blk.strip()]
+            raw_blocks = [blk for blk in f.read().split('\n\n') if blk.strip()]
             raw_blocks = raw_blocks [:-1]
 
         frames = []
         for blk in raw_blocks:
-            lines = [l for l in blk.split('\n')]#if l.strip()]
+            lines = [l for l in blk.split('\n')if l.strip()]
             pts = []
             for i in lines :
                 if len(i)==1:
@@ -184,7 +263,7 @@ class IPNDataset(Dataset):
                     coords = i.split(';')
                     coords = list(filter(lambda x: len(x), coords))
                     coords = [float(x) for x in coords] 
-                pts.append(coords)
+                pts.append(coords[:3])
             arr = np.asarray(pts, dtype=np.float32)
             if arr.shape == (21, 3):
                 frames.append(arr)
@@ -192,21 +271,10 @@ class IPNDataset(Dataset):
         if len(frames) < 2:
             return None  # not enough frames
 
-        seq = np.stack(frames, axis=0)  # (T,21,5)
+        seq = np.stack(frames, axis=0)  
         return self._post_process(seq)
 
-    # def _load_file(self, path):
-    #     if not os.path.exists(path): 
-    #         return None
-    #     # IPN: one frame per line, 21 joints × 3 floats each
-    #     coords = np.loadtxt(path, delimiter=' ', dtype=np.float32)  # shape = (T_raw, 63)
-    #     if coords.ndim != 2 or coords.shape[1] != 63:
-    #         return None
-    #     frames = coords.reshape(-1, 21, 3)  # (T_raw, 21, 3)
-    #     if frames.shape[0] < 2:
-    #         return None
-    #     return self._post_process(frames)
-
+    
     def _post_process(self, seq):
         # seq: (T, 21, 5)
         feats = seq  # keep only [x,y,z,vis,conn]
@@ -237,59 +305,59 @@ class IPNDataset(Dataset):
                 for c in range(3):
                     tmp[:, v, c] = np.interp(new, old, feats[:, v, c])
             feats = tmp
+        
+        velocity = np.zeros_like(feats)
+        velocity[1:] = feats[1:] - feats[:-1]
+        
+        # Acceleration
+        acceleration = np.zeros_like(feats)
+        acceleration[1:-1] = velocity[2:] - velocity[1:-1]
+        
+        # Combine into single array: [x, y, z, vx, vy, vz, ax, ay, az]
+        enhanced = np.concatenate([feats, velocity, acceleration], axis=-1)
+        return enhanced  # (max_seq, 21, 9)
 
-        return feats  # shape = (max_seq,21,5)
+        # return feats
+
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        # feats, label = self.samples[idx]
-        feats = self.samples[idx]
-        x = torch.from_numpy(feats).permute(2, 0, 1)  # → (C=5, T, V)
-        # A = build_temporal_edges(self.max_seq, device=x.device)
-        # # y = torch.tensor(label, dtype=torch.long)
-        # # return {'Sequence': x, 'Label': y}
-        # return {'Sequence': x, 'AM': A}
-        A_temporal = build_temporal_edges(self.max_seq, device=x.device)
-        A_spatial  = IPN_AM.to(x.device)                  # (V, V)
-        # we’ll broadcast spatial across time or batch in the model
+        feats = self.samples[idx]                       # <-- only feats
+        x = torch.from_numpy(feats).permute(2, 0, 1)    # [9, T, V]
+
+        A_temporal = build_temporal_edges(
+            self.max_seq,
+            device=x.device,
+            model=self.temporal_edge_model,             # None -> fixed rules
+            x=x,
+            threshold=self.edge_threshold
+        )
+        A_spatial = IPN_AM.to(x.device)
+
         return {
-           'Sequence': x,
-           'A_temporal': A_temporal,                      # (T, V, V)
-           'A_spatial' : A_spatial                        # (V, V)
+            'Sequence': x,
+            'A_temporal': A_temporal,
+            'A_spatial': A_spatial
         }
     
 
-    ####################################333333
+    ####################################
 
 class FinetuningDataset(Dataset):
-    def __init__(self, data_dir,ann_file,max_seq=80, normalize=False):
-        
-        assert opt.exists(data_dir), 'path {} does not exist'.format(data_dir)
-        ## data
+    
+    def __init__(self, data_dir, ann_file, max_seq=80, normalize=False,
+                 temporal_edge_model=None, edge_threshold=0.5):
+        assert opt.exists(data_dir), f'path {data_dir} does not exist'
         self.data_dir  = data_dir
         self.ann_file  = ann_file
         self.normalize = normalize
-        self.max_seq = max_seq
-        
-        self.label_map = ["no_gesture",
-                            "point_1f",
-                            "point_2f",
-                            "click_1f",
-                            "click_2f",
-                            "throw_up",
-                            "throw_down",
-                            "throw_left",
-                            "throw_right",
-                            "open_twice",
-                            "double_click_1f",
-                            "double_click_2f",
-                            "zoom_in",
-                            "zoom_out",
-                            ]
-        
-        self.samples = []        
+        self.max_seq   = max_seq
+        self.label_map = LABELS
+        self.temporal_edge_model = temporal_edge_model
+        self.edge_threshold = edge_threshold
+        self.samples = []
         with open(self.ann_file, 'r') as f:
             for line in f:
                 parts = line.strip().split(',')
@@ -369,26 +437,66 @@ class FinetuningDataset(Dataset):
                 for c in range(3):
                     tmp[:, v, c] = np.interp(new, old, feats[:, v, c])
             feats = tmp
-
-        return feats  # shape = (max_seq,21,5)
+        
+        velocity = np.zeros_like(feats)
+        velocity[1:] = feats[1:] - feats[:-1]
+        
+        # Acceleration
+        acceleration = np.zeros_like(feats)
+        acceleration[1:-1] = velocity[2:] - velocity[1:-1]
+        
+        # Combine into single array: [x, y, z, vx, vy, vz, ax, ay, az]
+        enhanced = np.concatenate([feats, velocity, acceleration], axis=-1)
+        return enhanced  # (max_seq, 21, 9)
 
     def __len__(self):
         return len(self.samples)
+    
+    # def normalize_sequence_length(self, sequence, max_length):
+    #     """
+    #     """
+    #     if len(sequence) > max_length:
+    #         delta = self.get_delta(sequence)
+    #         norm_sequence = sequence[top_k(delta, max_length)][0]
+            
+    #     elif len(sequence) < max_length:
+            
+    #         #norm_sequence = self.upsample(sequence, max_length)
+    #         norm_sequence = interpolate_landmarks(sequence, max_length)
+    #     else:
+    #         norm_sequence = sequence
+        
+    #     return norm_sequence
+    
+    # def get_delta(self, landmarks):
+    #     delta_moving = np.mean(landmarks[1:, self.moving_lands, :3] - landmarks[:-1, self.moving_lands, :3], axis=(1, 2))
+    #     delta_static = np.mean(landmarks[1:, self.static_lands, :3] - landmarks[:-1, self.static_lands, :3], axis=(1, 2))
+    #     delta_global = np.mean(landmarks[1:, :, :3] - landmarks[:-1, :, :3], axis=(1, 2))
+        
+    #     delta = self.lambda_moving * delta_moving + self.lambda_static * delta_static + self.lambda_global * delta_global
+    #     delta = np.concatenate(([0], delta))
+        
+    #     return delta
 
     def __getitem__(self, idx):
         feats, label = self.samples[idx]
-        x = torch.from_numpy(feats).permute(2, 0, 1)  # → (C=5, T, V)
-        # A = build_temporal_edges(self.max_seq, device=x.device) 
-        # y = torch.tensor(label, dtype=torch.long)
-        # return {'Sequence': x, 'AM': A, 'Label': y}
-        A_temporal = build_temporal_edges(self.max_seq, device=x.device)
-        A_spatial  = IPN_AM.to(x.device)
+        x = torch.from_numpy(feats).permute(2, 0, 1)  # [9, T, V]
+
+        A_temporal = build_temporal_edges(
+            self.max_seq,
+            device=x.device,
+            model=self.temporal_edge_model,  # may be None -> fixed rules
+            x=x,
+            threshold=self.edge_threshold
+        )
+        A_spatial = IPN_AM.to(x.device)
         y = torch.tensor(label, dtype=torch.long)
+
         return {
-          'Sequence'  : x,
-          'A_temporal': A_temporal,
-          'A_spatial' : A_spatial,
-          'Label'     : y
+            'Sequence': x,
+            'A_temporal': A_temporal,
+            'A_spatial': A_spatial,
+            'Label': y
         }
 
 
@@ -409,12 +517,13 @@ if __name__ == '__main__':
     print('\nFinetuning dataset:')
     dataset = FinetuningDataset(data_dir="D:\\Dataset\\IPN\\ipn\\landmarks", 
                                 ann_file="D:\\Dataset\\IPN\\ipn\\annotations\\Annot_TrainList_splitted.txt" ,
-                                normalize=True)
+                                
+                               )
     loader = DataLoader(dataset, batch_size=4, shuffle=True)
 
     batch = next(iter(loader))
     print('Sequence shape:', batch['Sequence'].shape)
-    # print('Batch[ "A_temporal" ] shape:', batch['A_temporal'].shape)
+    print('Batch[ "A_temporal" ] shape:', batch['A_temporal'].shape)
     print('Batch[ "A_spatial" ] shape:', batch['A_spatial'].shape)
     print('Labels        :', batch['Label'])
     
