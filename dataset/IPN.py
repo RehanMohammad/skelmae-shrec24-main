@@ -5,17 +5,7 @@ import tqdm
 import os.path as opt
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
-# from utils.graph import build_temporal_edges
-
-
-# 21‐joint hand connectivity (MediaPipe style)
-# HAND_CONNECTIONS = [
-#     (0,1),(1,2),(2,3),(3,4),(4,5),
-#     (1,6),(6,7),(7,8),(8,9),
-#     (1,10),(10,11),(11,12),(12,13),
-#     (1,14),(14,15),(15,16),(16,17),
-#     (1,18),(18,19),(19,20)
-# ]
+from utils.temporal_teacher import velocity_similarity_teacher
 
 
 LABELS= ["no_gesture",
@@ -119,14 +109,15 @@ def build_temporal_edges(
     model=None,
     x: torch.Tensor=None,
     threshold: float = 0.5,
-) -> torch.Tensor:
+    return_scores: bool = False,     # NEW
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Build temporal adjacency A[t] for links from frame t -> t+1.
-    If `model` is None or `x` is None -> fixed rules.
-    Else -> use per-frame attention from (current, next) frames.
 
     Returns:
-        Bool tensor [T, 21, 21]; last frame is all zeros.
+        - if return_scores=False (default): Bool tensor [T, V, V]
+        - if return_scores=True: (A_bool [T,V,V], scores_full [T,V,V])
+          where scores_full[T-1] == 0 (padded last frame)
     """
     V = 21
     A = torch.zeros((T, V, V), dtype=torch.bool, device=device)
@@ -137,20 +128,20 @@ def build_temporal_edges(
             for src, dest_list in _TEMPORAL_RULES.items():
                 for dst in dest_list:
                     A[t, src, dst] = True
+        if return_scores:
+            scores_full = A.float()   # fixed rules: treat as 0/1 scores
+            return A, scores_full
         return A
 
     # Ensure [B, C, T, V]
-    if x.dim() == 3:  # [C,T,V] from dataset
+    if x.dim() == 3:  # [C,T,V]
         x = x.unsqueeze(0)
-    assert x.dim() == 4, f"x must be [B,C,T,V], got {x.shape}"
+    assert x.dim() == 4
     B, C, T_in, V_in = x.shape
-    assert T_in == T, f"T mismatch: x has T={T_in}, expected {T}"
-    assert V_in == V, f"V mismatch: x has V={V_in}, expected {V}"
+    assert T_in == T and V_in == V
 
-    # use only xyz channels for attention
     xyz = x[:, :3, :, :]  # [B,3,T,V]
 
-    # Infer per-frame attention
     model_was_training = getattr(model, "training", False)
     if hasattr(model, "eval"): model.eval()
     attn_ts = []
@@ -158,23 +149,22 @@ def build_temporal_edges(
         for t in range(T - 1):
             cur = xyz[:, :, t,  :].permute(0, 2, 1)  # [B,V,3]
             nxt = xyz[:, :, t+1,:].permute(0, 2, 1)  # [B,V,3]
-            attn_t = model(cur, nxt)                 # expected [B, V, heads, V] or [B,V,V]
-
-            # normalize shapes -> [B, V, V]
-            if attn_t.dim() == 4 and attn_t.shape[2] >= 1:
-                attn_t = attn_t.mean(dim=2)         # avg heads
-            elif attn_t.dim() == 3:
-                pass
-            else:
-                raise ValueError(f"Unexpected attention shape {attn_t.shape}")
-            attn_ts.append(attn_t)                   # list of [B,V,V]
-
+            attn_t = model(cur, nxt)                 # [B, V, heads, V] or [B,V,V]
+            if attn_t.dim() == 4:
+                attn_t = attn_t.mean(dim=2)         # avg heads -> [B,V,V]
+            attn_ts.append(attn_t)
     if model_was_training and hasattr(model, "train"): model.train()
 
-    # stack to [B, T-1, V, V] then average over batch and binarize
-    scores = torch.stack(attn_ts, dim=1).mean(dim=0)   # [T-1, V, V]
+    # [B, T-1, V, V] -> [T-1, V, V] by batch mean
+    scores = torch.stack(attn_ts, dim=1).mean(dim=0)           # [T-1, V, V]
     A[:-1] = scores > threshold
+
+    if return_scores:
+        scores_full = torch.zeros((T, V, V), device=device, dtype=scores.dtype)
+        scores_full[:-1] = scores
+        return A, scores_full
     return A
+
 
 
 def get_adjacency_matrix(connections):
@@ -276,21 +266,18 @@ class IPNDataset(Dataset):
 
     
     def _post_process(self, seq):
-        # seq: (T, 21, 5)
-        feats = seq  # keep only [x,y,z,vis,conn]
+        
+        feats = seq.copy()
 
         # normalize XYZ if desired
         if self.normalize:
-            mask  = feats[..., :3] != -1.0
-            valid = feats[..., :3][mask]
-            if valid.size:
-                m, s = valid.mean(), valid.std()
-                feats[..., :3] = (feats[..., :3] - m) / (s + 1e-6)
+            m, s = feats.mean(), feats.std()
+            feats = (feats - m) / (s + 1e-6)
 
         T = feats.shape[0]
         # top‐k by movement magnitude if too long
         if T > self.max_seq:
-            delta = np.linalg.norm(seq[1:,...,:3] - seq[:-1,...,:3], axis=(1,2))
+            delta = np.linalg.norm(seq[1:] - seq[:-1], axis=(1,2))
             idxs  = np.argsort(-delta)[: self.max_seq]
             idxs  = np.sort(np.concatenate(([0], idxs)))[: self.max_seq]
             feats = feats[idxs]
@@ -306,16 +293,7 @@ class IPNDataset(Dataset):
                     tmp[:, v, c] = np.interp(new, old, feats[:, v, c])
             feats = tmp
         
-        velocity = np.zeros_like(feats)
-        velocity[1:] = feats[1:] - feats[:-1]
-        
-        # Acceleration
-        acceleration = np.zeros_like(feats)
-        acceleration[1:-1] = velocity[2:] - velocity[1:-1]
-        
-        # Combine into single array: [x, y, z, vx, vy, vz, ax, ay, az]
-        enhanced = np.concatenate([feats, velocity, acceleration], axis=-1)
-        return enhanced  # (max_seq, 21, 9)
+        return feats  # (max_seq, 21, 3)
 
         # return feats
 
@@ -324,23 +302,28 @@ class IPNDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        feats = self.samples[idx]                       # <-- only feats
-        x = torch.from_numpy(feats).permute(2, 0, 1)    # [9, T, V]
+        feats = self.samples[idx]
+        x = torch.from_numpy(feats).permute(2, 0, 1)  # [3, T, V]
+        teacher = velocity_similarity_teacher(x.float(), tau=0.5, topk=4, remove_self=True)  # [T, V, V]
 
-        A_temporal = build_temporal_edges(
+
+        A_temporal, A_temporal_scores = build_temporal_edges(
             self.max_seq,
             device=x.device,
-            model=self.temporal_edge_model,             # None -> fixed rules
+            model=self.temporal_edge_model,
             x=x,
-            threshold=self.edge_threshold
+            threshold=self.edge_threshold,
+            return_scores=True,                         # NEW
         )
         A_spatial = IPN_AM.to(x.device)
 
         return {
-            'Sequence': x,
-            'A_temporal': A_temporal,
-            'A_spatial': A_spatial
+            'Sequence': x,                   # [3, T, V]
+            'A_spatial': A_spatial,          # [V, V]
+            'A_temporal_teacher': teacher,   # [T, V, V] (soft probs), last frame zero
+            'A_temporal': A_temporal, 'A_temporal_scores': A_temporal_scores, 
         }
+
     
 
     ####################################
@@ -408,21 +391,17 @@ class FinetuningDataset(Dataset):
         return self._post_process(seq)
 
     def _post_process(self, seq):
-        # seq: (T, 21, 5)
-        feats = seq  # keep only [x,y,z,vis,conn]
 
+        feats = seq.copy()
         # normalize XYZ if desired
         if self.normalize:
-            mask  = feats[..., :3] != -1.0
-            valid = feats[..., :3][mask]
-            if valid.size:
-                m, s = valid.mean(), valid.std()
-                feats[..., :3] = (feats[..., :3] - m) / (s + 1e-6)
+            m, s = feats.mean(), feats.std()
+            feats = (feats - m) / (s + 1e-6)
 
         T = feats.shape[0]
         # top‐k by movement magnitude if too long
         if T > self.max_seq:
-            delta = np.linalg.norm(seq[1:,...,:3] - seq[:-1,...,:3], axis=(1,2))
+            delta = np.linalg.norm(seq[1:] - seq[:-1], axis=(1,2))
             idxs  = np.argsort(-delta)[: self.max_seq]
             idxs  = np.sort(np.concatenate(([0], idxs)))[: self.max_seq]
             feats = feats[idxs]
@@ -438,64 +417,33 @@ class FinetuningDataset(Dataset):
                     tmp[:, v, c] = np.interp(new, old, feats[:, v, c])
             feats = tmp
         
-        velocity = np.zeros_like(feats)
-        velocity[1:] = feats[1:] - feats[:-1]
-        
-        # Acceleration
-        acceleration = np.zeros_like(feats)
-        acceleration[1:-1] = velocity[2:] - velocity[1:-1]
-        
-        # Combine into single array: [x, y, z, vx, vy, vz, ax, ay, az]
-        enhanced = np.concatenate([feats, velocity, acceleration], axis=-1)
-        return enhanced  # (max_seq, 21, 9)
+        return feats  # (max_seq, 21, 3)
 
     def __len__(self):
         return len(self.samples)
     
-    # def normalize_sequence_length(self, sequence, max_length):
-    #     """
-    #     """
-    #     if len(sequence) > max_length:
-    #         delta = self.get_delta(sequence)
-    #         norm_sequence = sequence[top_k(delta, max_length)][0]
-            
-    #     elif len(sequence) < max_length:
-            
-    #         #norm_sequence = self.upsample(sequence, max_length)
-    #         norm_sequence = interpolate_landmarks(sequence, max_length)
-    #     else:
-    #         norm_sequence = sequence
-        
-    #     return norm_sequence
-    
-    # def get_delta(self, landmarks):
-    #     delta_moving = np.mean(landmarks[1:, self.moving_lands, :3] - landmarks[:-1, self.moving_lands, :3], axis=(1, 2))
-    #     delta_static = np.mean(landmarks[1:, self.static_lands, :3] - landmarks[:-1, self.static_lands, :3], axis=(1, 2))
-    #     delta_global = np.mean(landmarks[1:, :, :3] - landmarks[:-1, :, :3], axis=(1, 2))
-        
-    #     delta = self.lambda_moving * delta_moving + self.lambda_static * delta_static + self.lambda_global * delta_global
-    #     delta = np.concatenate(([0], delta))
-        
-    #     return delta
-
+   
     def __getitem__(self, idx):
         feats, label = self.samples[idx]
-        x = torch.from_numpy(feats).permute(2, 0, 1)  # [9, T, V]
+        x = torch.from_numpy(feats).permute(2, 0, 1)  # [3, T, V]
+        teacher = velocity_similarity_teacher(x.float(), tau=0.5, topk=4, remove_self=True) 
 
-        A_temporal = build_temporal_edges(
+        A_temporal, A_temporal_scores = build_temporal_edges(
             self.max_seq,
             device=x.device,
             model=self.temporal_edge_model,  # may be None -> fixed rules
             x=x,
-            threshold=self.edge_threshold
+            threshold=self.edge_threshold,
+             return_scores=True
         )
         A_spatial = IPN_AM.to(x.device)
         y = torch.tensor(label, dtype=torch.long)
 
         return {
-            'Sequence': x,
-            'A_temporal': A_temporal,
-            'A_spatial': A_spatial,
+            'Sequence': x,                   # [3, T, V]
+            'A_spatial': A_spatial,          # [V, V]
+            'A_temporal_teacher': teacher,   # [T, V, V] (soft probs), last frame zeros
+            'A_temporal': A_temporal, 'A_temporal_scores': A_temporal_scores, 
             'Label': y
         }
 

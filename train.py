@@ -23,6 +23,8 @@ from model.vit import ViT
 from model.mae import MAE
 from utils.visualize import plot_temporal_heatmap 
 from model.temporal_attention import AdaptiveTemporal
+from utils.visualize_edges import plot_topk_temporal_edges
+
 import warnings
 warnings.filterwarnings(
     "ignore",                    # or "once" to show it only once
@@ -145,9 +147,9 @@ def visualize_attention(model, sample, epoch):
         dynamic_A = output['dynamic_A'].cpu()
         
         # Visualize for first head
-        plot_temporal_heatmap(dynamic_A, frame_idx=0, head_idx=0,
-                      title=f"Temporal A (epoch {epoch})",
+        plot_temporal_heatmap(dynamic_A, frame_idx=0, title=f"Temporal A (epoch {epoch})",
                       savepath=f"attention_epoch{epoch}.png")
+
         plt.savefig(f'attention_epoch{epoch}.png')
         plt.close()
 
@@ -182,7 +184,7 @@ if __name__ == '__main__':
     max_seq=cfg.mae.sequence_length,
     normalize=cfg.data.normalize,
     temporal_edge_model=temporal_att,    
-    edge_threshold=0.5
+    edge_threshold=0.05
 	)
     val_set = PretrainingDataset(
     data_dir=cfg.data.data_dir,
@@ -190,7 +192,7 @@ if __name__ == '__main__':
     max_seq=cfg.mae.sequence_length,
     normalize=cfg.data.normalize,
     temporal_edge_model=temporal_att,   
-    edge_threshold=0.5
+    edge_threshold=0.05
 	)
 		
     train_loader = DataLoader(
@@ -205,6 +207,33 @@ if __name__ == '__main__':
         shuffle=False,
         num_workers=4
     )
+    sample = val_set[0]
+    scores = sample['A_temporal_scores']   # [T, V, V], last frame zeros
+    plot_temporal_heatmap(
+        scores, frame_idx=0,
+        title="Temporal attention scores (t→t+1, frame 0)",
+        savepath="temporal_scores_f0.png"
+    )
+
+    # You can iterate a few frames to see dynamics:
+    for t in range( min(5, scores.shape[0]-1) ):
+        plot_temporal_heatmap(scores, frame_idx=t,
+                            title=f"Temporal attention scores @ t={t}",
+                            savepath=f"temporal_scores_f{t}.png")
+        
+    sample = val_set[0]  # first sample is fine; pick any index
+    scores = sample['A_temporal_scores']  # shape [T, V, V]; last frame is zeros
+
+    viz_dir = os.path.join(save_dir, 'viz_phase1')
+    os.makedirs(viz_dir, exist_ok=True)
+
+    # visualize a few frames (skip the last since it's padded)
+    for t in range(min(3, scores.shape[0] - 1)):
+        plot_topk_temporal_edges(
+            scores[t], k=40,
+            title=f"Top-k temporal edges @ t={t}",
+            savepath=os.path.join(viz_dir, f"topk_temporal_edges_t{t}.png")
+        )
     
     # Initialize MAE
     encoder = ViT(
@@ -326,7 +355,6 @@ if __name__ == '__main__':
         
         # Visualize joint importance
         if epoch % 10 == 0:
-            plot_joint_importance(sgcn)
             plt.savefig(f'joint_importance_epoch{epoch}.png')
             plt.close()
     
